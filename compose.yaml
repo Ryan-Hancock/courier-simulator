@@ -1,0 +1,52 @@
+# The whole of GekGo on a laptop: `make up`.
+name: gekgo
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_USER: gekgo
+      POSTGRES_PASSWORD: gekgo
+      POSTGRES_DB: gekgo
+    command: ["postgres", "-c", "shared_buffers=512MB", "-c", "max_wal_size=4GB"]
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gekgo -d gekgo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build: { context: ., args: { CMD: sim/geksim } }
+    command: ["migrate"]
+    environment: &db
+      DATABASE_URL: postgres://gekgo:gekgo@postgres:5432/gekgo?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  booking-api:
+    build: { context: ., args: { CMD: services/booking-api } }
+    environment:
+      <<: *db
+      ADDR: ":8080"
+    ports: ["8081:8080"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  tracking-ingest:
+    build: { context: ., args: { CMD: services/tracking-ingest } }
+    environment:
+      <<: *db
+      ADDR: ":8080"
+    ports: ["8082:8080"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+  ops-dashboard:
+    build: web/ops-dashboard
+    ports: ["8080:80"]
+    depends_on: [booking-api, tracking-ingest]
+
+volumes:
+  pgdata:

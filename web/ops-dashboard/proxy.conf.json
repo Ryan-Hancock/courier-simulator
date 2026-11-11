@@ -1,0 +1,4 @@
+{
+  "/api/booking": { "target": "http://localhost:8081", "pathRewrite": { "^/api/booking": "" } },
+  "/api/tracking": { "target": "http://localhost:8082", "pathRewrite": { "^/api/tracking": "" } }
+}
