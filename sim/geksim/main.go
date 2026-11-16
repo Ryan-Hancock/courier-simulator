@@ -5,6 +5,8 @@
 //	geksim osm                  refresh data/streets.tsv from OpenStreetMap
 //	geksim seed [flags]         build history (see geksim seed -h)
 //	geksim stats -out DIR       export measured numbers and charts for articles
+//	geksim bench [flags]        replay one moment's tracking load and measure it
+//	geksim bench-charts -out DIR  draw brief 1's charts from the bench data
 package main
 
 import (
@@ -37,6 +39,10 @@ func main() {
 		err = runSeed(ctx, args)
 	case "stats":
 		err = runStats(ctx, args)
+	case "bench":
+		err = runBench(ctx, args)
+	case "bench-charts":
+		err = runBenchCharts(ctx, args)
 	default:
 		usage()
 	}
@@ -47,7 +53,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: geksim migrate | osm | seed [flags] | stats [flags]")
+	fmt.Fprintln(os.Stderr, "usage: geksim migrate | osm | seed [flags] | stats [flags] | bench [flags] | bench-charts [flags]")
 	os.Exit(2)
 }
 

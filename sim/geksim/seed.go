@@ -68,6 +68,11 @@ type shift struct {
 	start, end time.Time
 }
 
+type driverDay struct {
+	driver int
+	day    string
+}
+
 type waypoint struct {
 	at time.Time
 	p  geo.Point
@@ -89,8 +94,8 @@ type seeder struct {
 
 	// shiftsByDay[date][city] lists the shifts working that day.
 	shiftsByDay map[string]map[string][]shift
-	// waypoints[driverIndex] for days that get GPS pings.
-	waypoints map[int][]waypoint
+	// waypoints[{driverIndex, day}] for days that get GPS pings.
+	waypoints map[driverDay][]waypoint
 	pingFrom  time.Time
 
 	jobRows   [][]any
@@ -159,7 +164,7 @@ func runSeed(ctx context.Context, args []string) error {
 		addrsCentral: map[string][]int64{},
 		depotIDs:     map[string]int64{},
 		shiftsByDay:  map[string]map[string][]shift{},
-		waypoints:    map[int][]waypoint{},
+		waypoints:    map[driverDay][]waypoint{},
 		pingFrom:     last.AddDate(0, 0, -(*pingDays - 1)),
 		nextJobID:    1,
 		counts:       map[string]int{},
@@ -690,7 +695,8 @@ func (s *seeder) makeJob(created time.Time, acc *account, pFail float64, cutoff 
 		status = statusFor[e.typ]
 		s.eventRows = append(s.eventRows, []any{id, e.typ, e.at, e.actor, e.payload})
 		if e.where != nil && drvIdx >= 0 && !e.at.Before(s.pingFrom) {
-			s.waypoints[drvIdx] = append(s.waypoints[drvIdx], waypoint{e.at, *e.where})
+			k := driverDay{drvIdx, dayKey(e.at.In(s.loc))}
+			s.waypoints[k] = append(s.waypoints[k], waypoint{e.at, *e.where})
 		}
 	}
 	var driverID any
@@ -747,7 +753,7 @@ func (s *seeder) seedPings(ctx context.Context) error {
 				dr := s.drivers[sh.driver]
 				path := []waypoint{{sh.start, depot}}
 				var todays []waypoint
-				for _, w := range s.waypoints[sh.driver] {
+				for _, w := range s.waypoints[driverDay{sh.driver, dayKey(d)}] {
 					if !w.at.Before(sh.start) && w.at.Before(sh.end) {
 						todays = append(todays, w)
 					}
