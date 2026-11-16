@@ -148,7 +148,7 @@ func runSeed(ctx context.Context, args []string) error {
 	}
 	if *reset {
 		if _, err := pool.Exec(ctx, `TRUNCATE depots, zones, addresses, accounts, customers, drivers, vehicles,
-			shifts, jobs, job_events, routes, route_stops, location_pings, proofs_of_delivery,
+			shifts, jobs, job_events, routes, route_stops, location_pings, driver_positions, proofs_of_delivery,
 			invoices, invoice_lines RESTART IDENTITY CASCADE`); err != nil {
 			return err
 		}
@@ -740,6 +740,11 @@ func (s *seeder) seedPings(ctx context.Context) error {
 		(driver_id bigint, at timestamptz, lon float8, lat float8, speed real, battery real)`); err != nil {
 		return err
 	}
+	// Daily partitions for the ping window (days the historical partition
+	// covers are skipped).
+	if _, err := s.pool.Exec(ctx, `SELECT ensure_ping_partitions(($1::timestamptz AT TIME ZONE 'Europe/London')::date, 7)`, s.pingFrom); err != nil {
+		return err
+	}
 	const step = 10 * time.Second
 	const maxKmh = 40.0 // city average; waypoints that would need more are skipped
 	for d := s.pingFrom; !d.After(s.cfg.until); d = d.AddDate(0, 0, 1) {
@@ -823,7 +828,13 @@ func (s *seeder) seedPings(ctx context.Context) error {
 		s.counts["pings"] += len(rows)
 		slog.Info("pings", "day", dayKey(d), "rows", len(rows))
 	}
-	_, err := s.pool.Exec(ctx, `DROP TABLE seed_pings`)
+	if _, err := s.pool.Exec(ctx, `DROP TABLE seed_pings`); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO driver_positions
+		SELECT p.* FROM drivers d CROSS JOIN LATERAL (
+			SELECT driver_id, at, location, speed_kmh, battery_pct
+			FROM location_pings WHERE driver_id = d.id ORDER BY at DESC LIMIT 1) p`)
 	return err
 }
 

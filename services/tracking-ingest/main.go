@@ -10,9 +10,8 @@
 //	GET  /v1/history/deliveries     delivery counts on a grid, for the map
 //	GET  /healthz
 //
-// Known gaps, kept on purpose for later briefs:
-//   - latest-position queries scan location_pings, which has no time index
-//     and no partitions, so they slow down as the day goes on (brief 1)
+// location_pings is partitioned by day; driver_positions holds each
+// driver's latest ping (brief 1). Known gaps, kept on purpose for later briefs:
 //   - pings go straight to Postgres; Pub/Sub sits in front later (brief 7)
 package main
 
@@ -41,6 +40,7 @@ func main() {
 	}
 	defer pool.Close()
 	s := &service{db: pool, now: time.Now}
+	go s.keepPartitions(context.Background())
 	srv := &http.Server{
 		Addr:              httpx.Env("ADDR", ":8082"),
 		Handler:           httpx.Logged(s.routes()),
@@ -55,6 +55,25 @@ func main() {
 type service struct {
 	db  *pgxpool.Pool
 	now func() time.Time
+}
+
+// keepPartitions makes sure the next week of daily ping partitions exists,
+// at startup and then every hour.
+func (s *service) keepPartitions(ctx context.Context) {
+	for {
+		var n int
+		err := s.db.QueryRow(ctx, `SELECT ensure_ping_partitions((now() AT TIME ZONE 'Europe/London')::date, 7)`).Scan(&n)
+		if err != nil {
+			slog.Error("ping partitions", "err", err)
+		} else if n > 0 {
+			slog.Info("ping partitions created", "count", n)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Hour):
+		}
+	}
 }
 
 func (s *service) routes() http.Handler {
@@ -111,9 +130,22 @@ func (s *service) pings(w http.ResponseWriter, r *http.Request) {
 		}
 		drivers[i], ats[i], lats[i], lons[i], speeds[i], bats[i] = p.DriverID, p.At, p.Lat, p.Lon, p.SpeedKmh, p.BatteryPct
 	}
-	_, err := s.db.Exec(r.Context(), `INSERT INTO location_pings (driver_id, at, location, speed_kmh, battery_pct)
-		SELECT d, a, ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography, sp, b
-		FROM unnest($1::bigint[], $2::timestamptz[], $3::float8[], $4::float8[], $5::real[], $6::real[]) AS t(d, a, lat, lon, sp, b)`,
+	// One statement stores the pings and moves each driver's latest position
+	// forward (never backwards: a late batch from a phone that lost signal
+	// doesn't overwrite a newer position).
+	_, err := s.db.Exec(r.Context(), `WITH p AS (
+			SELECT d, a, ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography AS g, sp, b
+			FROM unnest($1::bigint[], $2::timestamptz[], $3::float8[], $4::float8[], $5::real[], $6::real[]) AS t(d, a, lat, lon, sp, b)
+		), stored AS (
+			INSERT INTO location_pings (driver_id, at, location, speed_kmh, battery_pct)
+			SELECT d, a, g, sp, b FROM p
+		)
+		INSERT INTO driver_positions (driver_id, at, location, speed_kmh, battery_pct)
+		SELECT DISTINCT ON (d) d, a, g, sp, b FROM p ORDER BY d, a DESC
+		ON CONFLICT (driver_id) DO UPDATE
+			SET at = EXCLUDED.at, location = EXCLUDED.location,
+			    speed_kmh = EXCLUDED.speed_kmh, battery_pct = EXCLUDED.battery_pct
+			WHERE driver_positions.at < EXCLUDED.at`,
 		drivers, ats, lats, lons, speeds, bats)
 	if err != nil {
 		serverError(w, err)
@@ -241,8 +273,7 @@ type position struct {
 }
 
 // track is what the customer tracking page polls. It finds the job's driver
-// and their latest ping. With only a driver_id index, Postgres reads every
-// ping that driver has ever sent and sorts them: brief 1's slow query.
+// and reads their latest position: one row by primary key (brief 1).
 func (s *service) track(w http.ResponseWriter, r *http.Request) {
 	jobID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -275,7 +306,7 @@ func (s *service) track(w http.ResponseWriter, r *http.Request) {
 	if driverID != nil && out.Status == "out_for_delivery" {
 		var p position
 		err := s.db.QueryRow(ctx, `SELECT driver_id, at, ST_Y(location::geometry), ST_X(location::geometry), speed_kmh, battery_pct
-			FROM location_pings WHERE driver_id = $1 ORDER BY at DESC LIMIT 1`, *driverID).
+			FROM driver_positions WHERE driver_id = $1`, *driverID).
 			Scan(&p.DriverID, &p.At, &p.Lat, &p.Lon, &p.SpeedKmh, &p.BatteryPct)
 		if err == nil {
 			out.Driver = &p
@@ -319,7 +350,11 @@ func (s *service) positions(w http.ResponseWriter, r *http.Request) {
 // pingRange tells the ops map which times it can replay.
 func (s *service) pingRange(w http.ResponseWriter, r *http.Request) {
 	var from, to *time.Time
-	if err := s.db.QueryRow(r.Context(), `SELECT min(at), max(at) FROM location_pings`).Scan(&from, &to); err != nil {
+	// min/max per driver walks the (driver_id, at DESC) index from each end:
+	// ~200 index lookups instead of reading 120 million rows.
+	if err := s.db.QueryRow(r.Context(), `SELECT min(f.at), max(l.at) FROM drivers d
+		CROSS JOIN LATERAL (SELECT at FROM location_pings WHERE driver_id = d.id ORDER BY at LIMIT 1) f
+		CROSS JOIN LATERAL (SELECT at FROM location_pings WHERE driver_id = d.id ORDER BY at DESC LIMIT 1) l`).Scan(&from, &to); err != nil {
 		serverError(w, err)
 		return
 	}
